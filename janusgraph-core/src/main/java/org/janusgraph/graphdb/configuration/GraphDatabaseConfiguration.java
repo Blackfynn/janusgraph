@@ -46,6 +46,7 @@ import org.janusgraph.graphdb.database.cache.SchemaCache;
 import org.janusgraph.graphdb.database.serialize.StandardSerializer;
 import org.janusgraph.util.encoding.LongEncoding;
 import org.janusgraph.util.system.ConfigurationUtil;
+import org.janusgraph.util.system.LoggerUtil;
 import org.janusgraph.util.system.NetworkUtil;
 
 import org.apache.tinkerpop.gremlin.structure.Graph;
@@ -110,6 +111,12 @@ public class GraphDatabaseConfiguration {
             "Useful when operating JanusGraph in concert with another storage system that assigns long ids but disables some " +
             "of JanusGraph's advanced features which can lead to inconsistent data. EXPERT FEATURE - USE WITH GREAT CARE.",
             ConfigOption.Type.FIXED, false);
+
+    public static final ConfigOption<String> GRAPH_NAME = new ConfigOption<String>(GRAPH_NS, "graphname",
+            "This config option is an optional configuration setting that you may supply when opening a graph. " +
+            "The String value you provide will be the name of your graph. If you use the ConfigurationManagament APIs, " +
+            "then you will be able to access your graph by this String representation using the ConfiguredGraphFactory APIs.",
+            ConfigOption.Type.LOCAL, String.class);
 
     public static final ConfigOption<TimestampProviders> TIMESTAMP_PROVIDER = new ConfigOption<TimestampProviders>(GRAPH_NS, "timestamps",
             "The timestamp resolution to use when writing to storage and indices. Sets the time granularity for the " +
@@ -393,10 +400,19 @@ public class GraphDatabaseConfiguration {
     public static final ConfigNamespace STORAGE_NS = new ConfigNamespace(ROOT_NS,"storage","Configuration options for the storage backend.  Some options are applicable only for certain backends.");
 
     /**
+     * Storage root directory for those storage backends that require local storage
+     */
+    public static final ConfigOption<String> STORAGE_ROOT = new ConfigOption<String>(STORAGE_NS,"root",
+            "Storage root directory for those storage backends that require local storage. " +
+            "If you do not supply storage.directory and you do supply graph.graphname, then your data " +
+            "will be stored in the directory equivalent to <STORAGE_ROOT>/<GRAPH_NAME>.",
+            ConfigOption.Type.LOCAL, String.class);
+
+    /**
      * Storage directory for those storage backends that require local storage
      */
     public static final ConfigOption<String> STORAGE_DIRECTORY = new ConfigOption<String>(STORAGE_NS,"directory",
-            "Storage directory for those storage backends that require local storage",
+            "Storage directory for those storage backends that require local storage.",
             ConfigOption.Type.LOCAL, String.class);
 //    public static final String STORAGE_DIRECTORY_KEY = "directory";
 
@@ -576,6 +592,11 @@ public class GraphDatabaseConfiguration {
 //    public static final int PAGE_SIZE_DEFAULT = 100;
 //    public static final String PAGE_SIZE_KEY = "page-size";
 
+    public static final ConfigOption<Boolean> DROP_ON_CLEAR = new ConfigOption<>(STORAGE_NS, "drop-on-clear",
+        "Whether to drop the graph database (true) or delete rows (false) when clearing storage. " +
+            "Note that some backends always drop the graph database when clearing storage. Also note that indices are " +
+            "always dropped when clearing storage.",
+        ConfigOption.Type.MASKABLE, true);
 
     public static final ConfigNamespace LOCK_NS =
             new ConfigNamespace(STORAGE_NS, "lock", "Options for locking on eventually-consistent stores");
@@ -724,7 +745,7 @@ public class GraphDatabaseConfiguration {
     public static final ConfigOption<String> IDS_STORE_NAME = new ConfigOption<>(IDS_NS, "store-name",
         "The name of the ID KCVStore. IDS_STORE_NAME is meant to be used only for backward compatibility with Titan, " +
             "and should not be used explicitly in normal operations or in new graphs.",
-        ConfigOption.Type.GLOBAL_OFFLINE, "janusgraph_ids");
+        ConfigOption.Type.GLOBAL_OFFLINE, JanusGraphConstants.JANUSGRAPH_ID_STORE_NAME);
 
 
     /**
@@ -892,8 +913,9 @@ public class GraphDatabaseConfiguration {
             ConfigOption.Type.MASKABLE, String.class);
 
     public static final ConfigOption<Integer> INDEX_MAX_RESULT_SET_SIZE = new ConfigOption<Integer>(INDEX_NS, "max-result-set-size",
-            "Maxium number of results to return if no limit is specified",
-            ConfigOption.Type.MASKABLE, 100000);
+            "Maxium number of results to return if no limit is specified. For index backends that support scrolling, it represents " +
+                    "the number of results in each batch",
+            ConfigOption.Type.MASKABLE, 50);
 
     public static final ConfigOption<Boolean> INDEX_NAME_MAPPING = new ConfigOption<Boolean>(INDEX_NS,"map-name",
             "Whether to use the name of the property key as the field name in the index. It must be ensured, that the" +
@@ -1252,6 +1274,7 @@ public class GraphDatabaseConfiguration {
 //    public static final String GANGLIA_SPOOF_KEY = "spoof";
 //    public static final String GANGLIA_SPOOF_DEFAULT = null;
 
+
     /**
      * The configuration namespace within {@link #METRICS_NS} for
      * Graphite.
@@ -1385,10 +1408,12 @@ public class GraphDatabaseConfiguration {
                     TimestampProviders backendPreference = null;
                     if (f.hasTimestamps() && null != (backendPreference = f.getPreferredTimestamps())) {
                         globalWrite.set(TIMESTAMP_PROVIDER, backendPreference);
-                        log.info("Set timestamps to {} according to storage backend preference", globalWrite.get(TIMESTAMP_PROVIDER));
+                        log.info("Set timestamps to {} according to storage backend preference",
+                            LoggerUtil.sanitizeAndLaunder(globalWrite.get(TIMESTAMP_PROVIDER)));
                     }
                     globalWrite.set(TIMESTAMP_PROVIDER, TIMESTAMP_PROVIDER.getDefaultValue());
-                    log.info("Set default timestamp provider {}", globalWrite.get(TIMESTAMP_PROVIDER));
+                    log.info("Set default timestamp provider {}",
+                        LoggerUtil.sanitizeAndLaunder(globalWrite.get(TIMESTAMP_PROVIDER)));
                 } else {
                     log.info("Using configured timestamp provider {}", localbc.get(TIMESTAMP_PROVIDER));
                 }
@@ -1402,7 +1427,7 @@ public class GraphDatabaseConfiguration {
                         throw new JanusGraphException(String.format(INCOMPATIBLE_VERSION_EXCEPTION, version, JanusGraphConstants.VERSION));
                     }
                 } catch (IllegalStateException ise) {
-                    checkBackwardCompatibilityWithTitan(globalWrite);
+                    checkBackwardCompatibilityWithTitan(globalWrite, localbc, kcvsConfig, overwrite);
                 }
 
                 final boolean managedOverridesAllowed;
@@ -1425,6 +1450,12 @@ public class GraphDatabaseConfiguration {
 
                     // Get the storage backend's setting and compare with localValue
                     Object storeValue = globalWrite.get(opt, pid.umbrellaElements);
+
+                    // Check if the value is to be overwritten
+                    if (overwrite.has(opt, pid.umbrellaElements))
+                    {
+                    	storeValue = overwrite.get(opt, pid.umbrellaElements);
+                    }
 
                     // Most validation predicate impls disallow null, but we can't assume that here
                     final boolean match;
@@ -1493,11 +1524,27 @@ public class GraphDatabaseConfiguration {
         preLoadConfiguration();
     }
 
-    private void checkBackwardCompatibilityWithTitan(ModifiableConfiguration globalWrite) {
+    private void checkBackwardCompatibilityWithTitan(ModifiableConfiguration globalWrite, BasicConfiguration localbc, KCVSConfiguration kcvsConfig, ModifiableConfiguration overwrite) {
         String version = globalWrite.get(TITAN_COMPATIBLE_VERSIONS);
         Preconditions.checkArgument(version!=null,"JanusGraph version nor Titan compatibility have not been initialized");
         if (!JanusGraphConstants.TITAN_COMPATIBLE_VERSIONS.contains(version)) {
             throw new JanusGraphException(String.format(INCOMPATIBLE_VERSION_EXCEPTION, version, JanusGraphConstants.VERSION));
+        }
+
+        // When connecting to a store created by Titan the ID store name will not be in the
+        // global configuration. To ensure compatibility override the default to titan_ids.
+        boolean localTitanConfigured = localbc.get(TITAN_COMPATIBLE_VERSIONS) != null;
+        boolean localIdStoreIsDefault = JanusGraphConstants.JANUSGRAPH_ID_STORE_NAME.equals(localbc.get(IDS_STORE_NAME));
+
+        if (localTitanConfigured == true) {
+            boolean usingTitanIdStore = localIdStoreIsDefault == true || JanusGraphConstants.TITAN_ID_STORE_NAME.equals(localbc.get(IDS_STORE_NAME));
+            boolean existingKeyStore = kcvsConfig.get(IDS_STORE_NAME.getName(), IDS_STORE_NAME.getDatatype()) != null;
+
+        	Preconditions.checkArgument(usingTitanIdStore,"ID store for Titan compatibility has not been initialized to: " + JanusGraphConstants.TITAN_ID_STORE_NAME);
+            if (existingKeyStore == false) {
+                log.info("Setting {} to {} for Titan compatibility", IDS_STORE_NAME.getName(), JanusGraphConstants.TITAN_ID_STORE_NAME);
+                overwrite.set(IDS_STORE_NAME, JanusGraphConstants.TITAN_ID_STORE_NAME);
+            }
         }
     }
 
@@ -1851,6 +1898,10 @@ public class GraphDatabaseConfiguration {
         backend.initialize(configuration);
         storeFeatures = backend.getStoreFeatures();
         return backend;
+    }
+
+    public String getGraphName() {
+        return getConfigurationAtOpen().getString(GRAPH_NAME.toString());
     }
 
     public StoreFeatures getStoreFeatures() {

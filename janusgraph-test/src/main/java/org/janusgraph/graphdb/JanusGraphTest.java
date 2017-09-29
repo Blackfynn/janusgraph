@@ -58,8 +58,9 @@ import org.janusgraph.core.schema.SchemaStatus;
 import org.janusgraph.core.schema.JanusGraphIndex;
 import org.janusgraph.core.schema.JanusGraphManagement;
 import org.janusgraph.core.schema.JanusGraphSchemaType;
-import org.janusgraph.core.util.ManagementUtil;
 import org.janusgraph.core.util.JanusGraphCleanup;
+import org.janusgraph.core.util.ManagementUtil;
+import org.janusgraph.diskstorage.Backend;
 import org.janusgraph.diskstorage.BackendException;
 import org.janusgraph.diskstorage.StaticBuffer;
 import org.janusgraph.diskstorage.configuration.ConfigElement;
@@ -181,6 +182,20 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
      */
     @Test
     public void testOpenClose() {
+    }
+
+    /**
+     * Ensure clearing storage actually removes underlying database.
+     * @throws Exception
+     */
+    @Test
+    public void testClearStorage() throws Exception {
+        tearDown();
+        config.set(ConfigElement.getPath(GraphDatabaseConfiguration.DROP_ON_CLEAR), true);
+        final Backend backend = getBackend(config, false);
+        assertTrue("graph should exist before clearing storage", backend.getStoreManager().exists());
+        clearGraph(config);
+        assertFalse("graph should not exist after clearing storage", backend.getStoreManager().exists());
     }
 
     /**
@@ -1360,6 +1375,94 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
     }
 
     @Test
+    public void testVertexCentricEdgeIndexOnSimpleMultiplicityShouldWork() {
+        clopen(option(LOG_SEND_DELAY, MANAGEMENT_LOG), Duration.ofMillis(0),
+                option(KCVSLog.LOG_READ_LAG_TIME, MANAGEMENT_LOG), Duration.ofMillis(50),
+                option(LOG_READ_INTERVAL, MANAGEMENT_LOG), Duration.ofMillis(250)
+        );
+        PropertyKey time = mgmt.makePropertyKey("time").dataType(Integer.class).cardinality(Cardinality.SINGLE).make();
+        EdgeLabel friend = mgmt.makeEdgeLabel("friend").multiplicity(Multiplicity.SIMPLE).make();
+        mgmt.buildEdgeIndex(friend, "byTime", Direction.OUT, decr, time);
+        finishSchema();
+        assertEquals(SchemaStatus.ENABLED, mgmt.getRelationIndex(mgmt.getRelationType("friend"), "byTime").getIndexStatus());
+        JanusGraphVertex v = tx.addVertex();
+        v = getV(tx, v);
+        for (int i = 200; i < 210; i++) {
+            JanusGraphVertex o = tx.addVertex();
+            v.addEdge("friend", o, "time", i);
+        }
+        evaluateQuery(v.query().labels("friend").direction(OUT).interval("time", 199, 210).orderBy("time", decr),
+            EDGE, 10, 1, new boolean[]{true, true}, tx.getPropertyKey("time"), Order.DESC);
+        tx.commit();
+        finishSchema();
+    }
+
+    @Test
+    public void testVertexCentricPropertyIndexOnSetCardinalityShouldWork() {
+        clopen(option(LOG_SEND_DELAY, MANAGEMENT_LOG), Duration.ofMillis(0),
+                option(KCVSLog.LOG_READ_LAG_TIME, MANAGEMENT_LOG), Duration.ofMillis(50),
+                option(LOG_READ_INTERVAL, MANAGEMENT_LOG), Duration.ofMillis(250)
+        );
+        PropertyKey time = mgmt.makePropertyKey("time").dataType(Integer.class).cardinality(Cardinality.SINGLE).make();
+        PropertyKey name = mgmt.makePropertyKey("name").dataType(String.class).cardinality(Cardinality.SET).make();
+        mgmt.buildPropertyIndex(name, "byTime", decr, time);
+        finishSchema();
+        assertEquals(SchemaStatus.ENABLED, mgmt.getRelationIndex(mgmt.getRelationType("name"), "byTime").getIndexStatus());
+        JanusGraphVertex v = tx.addVertex();
+        v = getV(tx, v);
+        for (int i = 200; i < 210; i++) {
+            v.property("name", String.valueOf(i), "time", i);
+        }
+        evaluateQuery(v.query().keys("name").interval("time", 199, 210).orderBy("time", decr),
+            PROPERTY, 10, 1, new boolean[]{true, true}, tx.getPropertyKey("time"), Order.DESC);
+        tx.commit();
+        finishSchema();
+    }
+
+    @Test
+    public void testVertexCentricIndexOrderingOnEdgePropertyWithCardinalityList() throws InterruptedException, ExecutionException {
+        clopen(option(LOG_SEND_DELAY, MANAGEMENT_LOG), Duration.ofMillis(0),
+                option(KCVSLog.LOG_READ_LAG_TIME, MANAGEMENT_LOG), Duration.ofMillis(50),
+                option(LOG_READ_INTERVAL, MANAGEMENT_LOG), Duration.ofMillis(250)
+        );
+        PropertyKey time = mgmt.makePropertyKey("time").dataType(Integer.class).cardinality(Cardinality.LIST).make();
+        EdgeLabel friend = mgmt.makeEdgeLabel("friend").multiplicity(Multiplicity.MULTI).make();
+        mgmt.buildEdgeIndex(friend, "byTime", Direction.OUT, decr, time);
+        finishSchema();
+        JanusGraphVertex v = tx.addVertex();
+        for (int i = 200; i < 210; i++) {
+            JanusGraphVertex o = tx.addVertex();
+            v.addEdge("friend", o, "time", i);
+        }
+        assertEquals(SchemaStatus.ENABLED, mgmt.getRelationIndex(mgmt.getRelationType("friend"), "byTime").getIndexStatus());
+        evaluateQuery(v.query().labels("friend").direction(OUT).interval("time", 201, 205).orderBy("time", decr),
+            EDGE, 4, 1, new boolean[]{true, true}, tx.getPropertyKey("time"), Order.DESC);
+        tx.commit();
+        finishSchema();
+    }
+
+    @Test
+    public void testVertexCentricIndexOrderingOnMetaPropertyWithCardinalityList() throws InterruptedException, ExecutionException {
+        clopen(option(LOG_SEND_DELAY, MANAGEMENT_LOG), Duration.ofMillis(0),
+                option(KCVSLog.LOG_READ_LAG_TIME, MANAGEMENT_LOG), Duration.ofMillis(50),
+                option(LOG_READ_INTERVAL, MANAGEMENT_LOG), Duration.ofMillis(250)
+        );
+        PropertyKey time = mgmt.makePropertyKey("time").dataType(Integer.class).cardinality(Cardinality.LIST).make();
+        PropertyKey sensor = mgmt.makePropertyKey("sensor").dataType(Integer.class).cardinality(Cardinality.LIST).make();
+        mgmt.buildPropertyIndex(sensor, "byTime", decr, time);
+        finishSchema();
+        JanusGraphVertex v = tx.addVertex();
+        for (int i = 200; i < 210; i++) {
+            v.property("sensor", i, "time", i);
+        }
+        assertEquals(SchemaStatus.ENABLED, mgmt.getRelationIndex(mgmt.getRelationType("sensor"), "byTime").getIndexStatus());
+        evaluateQuery(v.query().keys("sensor").interval("time", 201, 205).orderBy("time", decr),
+            PROPERTY, 4, 1, new boolean[]{true, true}, tx.getPropertyKey("time"), Order.DESC);
+        tx.commit();
+        finishSchema();
+    }
+
+    @Test
     public void testIndexUpdatesWithReindexAndRemove() throws InterruptedException, ExecutionException {
         clopen(option(LOG_SEND_DELAY, MANAGEMENT_LOG), Duration.ofMillis(0),
                 option(KCVSLog.LOG_READ_LAG_TIME, MANAGEMENT_LOG), Duration.ofMillis(50),
@@ -1611,7 +1714,6 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         tx.addVertex("name", "v3");
         tx.commit();
 
-        Thread.sleep(2000); //Wait for the index to register in graph2
         finishSchema();
         try {
             mgmt.updateIndex(mgmt.getGraphIndex("theIndex"), SchemaAction.ENABLE_INDEX);
@@ -1638,7 +1740,6 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         evaluateQuery(tx.query().has("name", "v3"), ElementCategory.VERTEX, 1, new boolean[]{true, true}, "theIndex");
         evaluateQuery(tx.query().has("name", "v4"), ElementCategory.VERTEX, 1, new boolean[]{true, true}, "theIndex");
 
-        Thread.sleep(2000);
         tx2 = graph2.newTransaction();
         evaluateQuery(tx2.query().has("name", "v1"), ElementCategory.VERTEX, 0, new boolean[]{true, true}, "theIndex");
         evaluateQuery(tx2.query().has("name", "v2"), ElementCategory.VERTEX, 1, new boolean[]{true, true}, "theIndex");

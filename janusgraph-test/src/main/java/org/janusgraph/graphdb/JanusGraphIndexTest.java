@@ -46,9 +46,12 @@ import org.janusgraph.diskstorage.BackendException;
 import org.janusgraph.diskstorage.configuration.ConfigElement;
 import org.janusgraph.diskstorage.configuration.WriteConfiguration;
 import org.janusgraph.diskstorage.indexing.IndexFeatures;
+import org.janusgraph.diskstorage.indexing.IndexInformation;
+import org.janusgraph.diskstorage.indexing.IndexProvider;
 import org.janusgraph.diskstorage.log.kcvs.KCVSLog;
 import org.janusgraph.diskstorage.util.time.TimestampProvider;
 import org.janusgraph.example.GraphOfTheGodsFactory;
+import org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration;
 import org.janusgraph.graphdb.database.management.ManagementSystem;
 import org.janusgraph.graphdb.internal.ElementCategory;
 import org.janusgraph.graphdb.internal.Order;
@@ -84,7 +87,6 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
-import java.util.function.Function;
 
 import static org.janusgraph.graphdb.JanusGraphTest.evaluateQuery;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.*;
@@ -168,7 +170,6 @@ public abstract class JanusGraphIndexTest extends JanusGraphBaseTest {
         assertGraphOfTheGods(graph);
     }
 
-
     public static void assertGraphOfTheGods(JanusGraph gotg) {
         assertCount(12, gotg.query().vertices());
         assertCount(3, gotg.query().has(LABEL_NAME, "god").vertices());
@@ -177,6 +178,32 @@ public abstract class JanusGraphIndexTest extends JanusGraphBaseTest {
         assertEquals("demigod", h.label());
         assertCount(5, h.query().direction(Direction.BOTH).edges());
         gotg.tx().commit();
+    }
+
+    /**
+     * Ensure clearing storage actually removes underlying graph and index databases.
+     * @throws Exception
+     */
+    @Test
+    public void testClearStorage() throws Exception {
+        GraphOfTheGodsFactory.load(graph);
+        tearDown();
+        config.set(ConfigElement.getPath(GraphDatabaseConfiguration.DROP_ON_CLEAR), true);
+        final Backend backend = getBackend(config, false);
+        assertStorageExists(backend, true);
+        clearGraph(config);
+        try { backend.close(); } catch (Exception e) { /* Most backends do not support closing after clearing */}
+        try (final Backend newBackend = getBackend(config, false)) {
+            assertStorageExists(newBackend, false);
+        }
+    }
+
+    private static void assertStorageExists(Backend backend, boolean exists) throws Exception {
+        final String suffix = exists ? "should exist before clearing" : "should not exist after clearing";
+        assertTrue("graph " + suffix, backend.getStoreManager().exists() == exists);
+        for (final IndexInformation index : backend.getIndexInformation().values()) {
+            assertTrue("index " + suffix, ((IndexProvider) index).exists() == exists);
+        }
     }
 
     @Test
@@ -1020,7 +1047,7 @@ public abstract class JanusGraphIndexTest extends JanusGraphBaseTest {
         } else {
             Assert.fail("Unknown index backend:" + backend);
         }
-        
+
         final PropertyKey field1Key = mgmt.makePropertyKey("field1").dataType(String.class).make();
         mgmt.buildIndex("store1", Vertex.class).addKey(field1Key).buildMixedIndex(INDEX);
         mgmt.commit();
@@ -1029,13 +1056,11 @@ public abstract class JanusGraphIndexTest extends JanusGraphBaseTest {
         JanusGraphVertex v2 = tx.addVertex();
         JanusGraphVertex v3 = tx.addVertex();
 
-        v1.property("field1", "Hello Hello Hello Hello Hello Hello Hello Hello");
+        v1.property("field1", "Hello Hello Hello Hello Hello Hello Hello Hello world");
         v2.property("field1", "Hello blue and yellow meet green");
-        v3.property("field1", "Hello");
+        v3.property("field1", "Hello Hello world world");
 
         tx.commit();
-
-        Thread.sleep(5000);
 
         List<JanusGraphVertex> vertices = new ArrayList<JanusGraphVertex>();
         for (JanusGraphIndexQuery.Result<JanusGraphVertex> r : graph.indexQuery("store1", "v.field1:(Hello)").addParameter(asc_sort_p).vertices()) {
@@ -1577,13 +1602,11 @@ public abstract class JanusGraphIndexTest extends JanusGraphBaseTest {
         JanusGraphVertex v2 = tx.addVertex();
         JanusGraphVertex v3 = tx.addVertex();
 
-        v1.property("text", "Hello Hello Hello Hello Hello Hello Hello Hello");
+        v1.property("text", "Hello Hello Hello Hello Hello Hello Hello Hello world");
         v2.property("text", "Hello abab abab fsdfsd sfdfsd sdffs fsdsdf fdf fsdfsd aera fsad abab abab fsdfsd sfdf");
-        v3.property("text", "Hello");
+        v3.property("text", "Hello Hello world world");
 
         tx.commit();
-
-        Thread.sleep(5000);
 
         Set<Double> scores = new HashSet<Double>();
         for (JanusGraphIndexQuery.Result<JanusGraphVertex> r : graph.indexQuery("store1", "v.text:(Hello)").vertices()) {
@@ -1607,8 +1630,6 @@ public abstract class JanusGraphIndexTest extends JanusGraphBaseTest {
         v1.property("name", "hercules was here");
 
         tx.commit();
-
-        Thread.sleep(2000);
 
         JanusGraphVertex r = Iterables.<JanusGraphVertex>get(graph.query().has("name", Text.CONTAINS, "hercules here").vertices(), 0);
         Assert.assertEquals(r.property("name").value(), "hercules was here");
@@ -1727,8 +1748,13 @@ public abstract class JanusGraphIndexTest extends JanusGraphBaseTest {
             testCollection(cardinality, "name", "Totoro", "Hiro");
             testCollection(cardinality, "age", 1, 2);
             testCollection(cardinality, "long", 1L, 2L);
-            testCollection(cardinality, "uuid", UUID.randomUUID(), UUID.randomUUID());
             testCollection(cardinality, "geopoint", Geoshape.point(1.0, 1.0), Geoshape.point(2.0, 2.0));
+            String backend = readConfig.get(INDEX_BACKEND, INDEX);
+            // Solr 6 has issues processing UUIDs with Multivalues 
+            // https://issues.apache.org/jira/browse/SOLR-11264
+            if (!"solr".equals(backend)) {
+                testCollection(cardinality, "uuid", UUID.randomUUID(), UUID.randomUUID());
+            }
         } else {
             try {
                 PropertyKey stringProperty = mgmt.makePropertyKey("name").dataType(String.class).cardinality(cardinality).make();
@@ -1811,7 +1837,6 @@ public abstract class JanusGraphIndexTest extends JanusGraphBaseTest {
             assertEquals(v1, getOnlyElement(graph.query().has(property, Geo.WITHIN, Geoshape.circle(2.0, 2.0, 0.1)).vertices()));
         }
 
-        
         // Test traversal property drop Issue #408
         GraphTraversalSource g = graph.traversal();
         g.V().drop().iterate();
@@ -1909,4 +1934,3 @@ public abstract class JanusGraphIndexTest extends JanusGraphBaseTest {
         }
     }
 }
-
